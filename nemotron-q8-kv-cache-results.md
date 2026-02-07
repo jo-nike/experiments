@@ -1,5 +1,6 @@
-[nemotron-q8-kv-cache-results.md](https://github.com/user-attachments/files/25154135/nemotron-q8-kv-cache-results.md)
-# KV Cache Quantization Results: q4_0 vs q8_0 at 128K & 256K Context
+[nemotron-q8-kv-cache-results.md](https://github.com/user-attachments/files/25154968/nemotron-q8-kv-cache-results.md)
+[nemotron-q8-kv-cache-results.md](https://github.com/user-attachments/files/25154968/nemotron-q8-kv-cache-results.md)
+# KV Cache Quantization Results: q4_0 vs q8_0 at 128K, 256K & 1M Context
 
 **Model:** NVIDIA Nemotron-3-Nano-30B-A3B (MXFP4 MoE GGUF)
 **Hardware:** RTX 5080 16GB + CPU offload
@@ -96,10 +97,89 @@ q8_0 @ 256K (n-cpu-moe=15)
 - **256K context needed?** Use **q4_0 with n-cpu-moe=11** for short-to-medium fills, or **q8_0 with n-cpu-moe=15** if you consistently fill >150K tokens.
 - No quality difference between q4_0 and q8_0 was detected in any test.
 
+## 1M Context Results
+
+### Server Configuration — 1M Context
+
+| | q4_0 @ 1M | q8_0 @ 1M |
+|---|---|---|
+| **Context length** | 1,048,576 | 1,048,576 |
+| **KV cache** | ~1,632 MiB | ~3,264 MiB |
+| **Compute buffer** | ~3,434 MiB | ~3,434 MiB |
+| **n-cpu-moe** | 30 | 36 (estimated) |
+
+**n-cpu-moe search for 1M context:**
+- **q4_0:** n-cpu-moe=25 starts but crashes during flash attention at ~389K tokens (transient VRAM). n-cpu-moe=30 is stable at full context. Values 26-29 were not tested.
+- **q8_0:** n-cpu-moe=28 OOM at startup. n-cpu-moe=29 OOM during loading. n-cpu-moe=30 starts but crashes during flash attention at ~1M tokens. n-cpu-moe=33 also crashes at ~1M tokens. Estimated n-cpu-moe=36 for stability (untested).
+
+> **Note on flash attention transient VRAM:** At 1M context, flash attention requires significant temporary GPU memory during inference that scales with sequence length. This is separate from the static KV cache allocation and compute buffer. It caused both q4_0 @ n-cpu-moe=25 and q8_0 @ n-cpu-moe=30 to crash mid-inference despite successful server startup. The extra 3 n-cpu-moe steps for q8_0 vs q4_0 (33 vs 30) reflect the larger q8_0 KV cache requiring more flash attention working memory.
+
+### Generation Speed — 1M Context (tokens/second)
+
+| Context Fill | q4_0 @ 1M (moe=30) | q8_0 @ 1M (moe=30) |
+|---|---|---|
+| 10K words (13K tok) | 64.9 | 62.7 |
+| 50K words (65K tok) | 56.2 | 57.6 |
+| 200K words (260K tok) | 40.0 | — |
+| 770K words (1M tok) | 19.1 | OOM crash* |
+
+\* q8_0 @ n-cpu-moe=30 and 33 both crash during flash attention at ~1M tokens. q8_0 works fine at smaller fills (10K, 50K words tested). Estimated n-cpu-moe=36 needed for full context stability, but at that level most MoE experts are on CPU, making q8_0 @ 1M impractical on 16GB VRAM.
+
+### Needle-in-a-Haystack — 1M Context (needle at 30% position)
+
+| Context Fill | q4_0 @ 1M | q8_0 @ 1M (moe=30) |
+|---|---|---|
+| 10K words (13K tok) | — | PASS |
+| 50K words (65K tok) | — | PASS |
+| 770K words (1M tok) | — | OOM |
+
+q4_0 @ 1M speed tests did not include needle validation. Separate needle tests at 10K/50K/200K words confirmed 100% pass rate (27/27) with n-cpu-moe=25.
+
+### Prompt Processing Speed — 1M Context (cold cache, tokens/second)
+
+| Context Fill | q4_0 @ 1M (moe=30) | q8_0 @ 1M (moe=30) |
+|---|---|---|
+| 10K words (13K tok) | 869 | 863 |
+| 50K words (65K tok) | 874 | 883 |
+| 200K words (260K tok) | 768 | — |
+| 770K words (1M tok) | 554 | OOM crash |
+
+Prompt processing speed is nearly identical between q4_0 and q8_0 at 1M context — the KV type matters less when n-cpu-moe is the same (30). This differs from the 128K/256K results where q4_0 was 10-17% faster, because at those smaller contexts the n-cpu-moe difference (fewer experts on CPU for q4_0) dominated.
+
+### Speed Degradation: 1M Context vs 128K/256K
+
+The 1M context allocation significantly reduces generation speed due to n-cpu-moe=30+ pushing most MoE experts to CPU:
+
+| Context Fill | q4_0 @ 128K (moe=9) | q4_0 @ 256K (moe=11) | q4_0 @ 1M (moe=30) | 1M vs 128K |
+|---|---|---|---|---|
+| 10K words | 97.0 t/s | 89.1 t/s | 64.9 t/s | -33% |
+| 50K words | 81.5 t/s | 72.9 t/s | 56.2 t/s | -31% |
+| 200K words | — | 47.3 t/s | 40.0 t/s | — |
+| 770K words | — | — | 19.1 t/s | — |
+
+Generation speed at 1M context drops ~31-33% vs 128K at equivalent fills, and falls to **19.1 t/s** when the context is nearly full (~1M tokens). The primary cause is n-cpu-moe=30 offloading most MoE computation to CPU vs n-cpu-moe=9-11 at smaller contexts.
+
+### 1M Context Key Takeaways
+
+1. **q4_0 and q8_0 perform nearly identically at low fills** when using the same n-cpu-moe — 62.7 vs 64.9 t/s at 10K words, 57.6 vs 56.2 t/s at 50K words.
+2. **q8_0 cannot reliably fill 1M context on 16GB VRAM.** Both n-cpu-moe=30 and 33 crash during flash attention at ~1M tokens. Estimated n-cpu-moe=36 needed, but at that level gen speed would be impractical.
+3. **Full-context generation at 1M is slow but usable with q4_0** — 19.1 t/s at 770K words (~1M tokens).
+4. **The 1M compute buffer (3,434 MiB) is the major VRAM cost** — 4× larger than the 256K buffer (905 MiB), consuming far more VRAM than the KV cache difference between q4_0 and q8_0.
+
+## Recommendation
+
+- **128K context needed?** Use **q4_0 with n-cpu-moe=9** — fastest at 97 t/s, smallest KV footprint.
+- **256K context needed?** Use **q4_0 with n-cpu-moe=11** for short-to-medium fills, or **q8_0 with n-cpu-moe=15** if you consistently fill >150K tokens.
+- **1M context needed?** Use **q4_0 with n-cpu-moe=30** — proven stable at full context, 19.1 t/s at ~1M tokens. q8_0 is not viable at full 1M context on 16GB VRAM (crashes at n-cpu-moe=33).
+- No quality difference between q4_0 and q8_0 was detected in any test up to 260K tokens.
+
 ## Raw Data
 
 - q4_0 256K (optimized): `test_results/needle_big_q4_0_optimized.json`
 - q4_0 128K: `test_results/needle_big_q4_0_128k.json`
 - q8_0 256K: `test_results/needle_big_q8_0_256k.json`
 - q8_0 128K: `test_results/needle_big_q8_0_128k.json`
-- Test script: `kv_needle_big.py`
+- q4_0 1M (speed): `test_results/speed_q4_0_1M.json`, `test_results/speed_q4_0_1M_770.json`
+- q8_0 1M (speed): `test_results/speed_q8_0_1M.json`
+- q4_0 1M (needle): `test_results/needle_big_q4_0_1M.json`
+- Test scripts: `kv_needle_big.py`, `kv_speed_bench.py`
